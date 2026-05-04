@@ -1,0 +1,20 @@
+{
+  "name": "@vinya/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "npm exec tsc -- -p tsconfig.json"
+  },
+  "dependencies": {
+    "next": "16.2.4",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}

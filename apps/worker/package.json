@@ -1,0 +1,17 @@
+{
+  "name": "@vinya/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "npm exec tsc -- -p tsconfig.json",
+    "typecheck": "npm exec tsc -- -p tsconfig.json"
+  },
+  "dependencies": {
+    "@vinya/db": "file:../../packages/db"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}

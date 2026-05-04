@@ -1,0 +1,37 @@
+{
+  "name": "vinya-app",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "bootstrap": "npm install",
+    "dev:web": "npm --workspace=@vinya/web run dev",
+    "dev:api": "npm --workspace=@vinya/api run dev",
+    "dev:worker": "npm --workspace=@vinya/worker run dev",
+    "build": "npm run build --workspace=@vinya/shared --workspace=@vinya/db && npm run build --workspace=@vinya/api --workspace=@vinya/worker --workspace=@vinya/web",
+    "prisma:generate": "npm --workspace=@vinya/db run prisma:generate",
+    "postinstall": "npm run prisma:generate"
+  },
+  "engines": {
+    "node": ">=20.9.0",
+    "npm": ">=9.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.15.0",
+    "@types/react": "18.3.0",
+    "@types/react-dom": "18.3.0",
+    "postcss": "8.5.13",
+    "prisma": "5.22.0",
+    "tsx": "4.21.0",
+    "typescript": "6.0.3"
+  },
+  "overrides": {
+    "postcss": "8.5.13",
+    "next": {
+      "postcss": "8.5.13"
+    }
+  }
+}

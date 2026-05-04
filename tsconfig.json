@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["DOM", "DOM.Iterable", "ES2023"],
+    "strict": true,
+    "esModuleInterop": false,
+    "ignoreDeprecations": "6.0",
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@vinya/db": ["packages/db/src"],
+      "@vinya/shared": ["packages/shared/src"]
+    }
+  },
+  "references": [
+    { "path": "packages/db" },
+    { "path": "packages/shared" },
+    { "path": "apps/api" },
+    { "path": "apps/worker" }
+  ],
+  "include": [],
+  "exclude": [
+    "apps/*/dist",
+    "packages/*/dist",
+    "node_modules"
+  ]
+}

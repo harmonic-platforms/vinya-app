@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": true,
+    "composite": true,
+    "noEmit": false,
+    "types": ["node"],
+    "moduleResolution": "NodeNext"
+  },
+  "include": ["src"],
+  "references": []
+}
