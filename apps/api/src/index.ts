@@ -24,6 +24,41 @@ const createGoogleOAuthClient = () => {
   })
 }
 
+const getAuthenticatedGmailClient = async (emailAccountId: string) => {
+  server.log.info({ emailAccountId }, 'Loading Gmail credentials for authenticated client')
+
+  const emailAccount = await prisma.emailAccount.findUnique({
+    where: { id: emailAccountId },
+    include: { gmailCredential: true },
+  })
+
+  if (!emailAccount) {
+    throw new Error('EmailAccount not found')
+  }
+
+  if (emailAccount.provider !== 'GMAIL') {
+    throw new Error('EmailAccount provider is not GMAIL')
+  }
+
+  if (emailAccount.status !== 'CONNECTED') {
+    throw new Error('EmailAccount is not connected')
+  }
+
+  const credential = emailAccount.gmailCredential
+  if (!credential || !credential.encryptedAccessToken) {
+    throw new Error('Gmail credentials not found for EmailAccount')
+  }
+
+  const oauth2Client = createGoogleOAuthClient()
+  oauth2Client.setCredentials({
+    access_token: credential.encryptedAccessToken,
+    refresh_token: credential.encryptedRefreshToken ?? undefined,
+    expiry_date: credential.tokenExpiresAt ? credential.tokenExpiresAt.getTime() : undefined,
+  })
+
+  return google.gmail({ version: 'v1', auth: oauth2Client })
+}
+
 server.get('/health', async () => {
   return { status: 'ok' }
 })
@@ -131,6 +166,75 @@ server.get('/auth/google/callback', async (request, reply) => {
   } catch (error) {
     server.log.error({ error }, 'Error during Gmail OAuth callback processing')
     return reply.status(500).send({ success: false, message: 'Gmail OAuth callback failed' })
+  }
+})
+
+server.get('/dev/gmail/messages', async (request, reply) => {
+  server.log.info('Reading recent Gmail messages for connected account')
+
+  try {
+    const emailAccount = await prisma.emailAccount.findFirst({
+      where: {
+        provider: 'GMAIL',
+        status: 'CONNECTED',
+      },
+    })
+
+    if (!emailAccount) {
+      server.log.warn('No connected Gmail EmailAccount found')
+      return reply.status(404).send({ success: false, message: 'No connected Gmail account found' })
+    }
+
+    const gmail = await getAuthenticatedGmailClient(emailAccount.id)
+    const listResponse = await gmail.users.messages.list({
+      userId: 'me',
+      maxResults: 5,
+    })
+
+    const gmailMessages = listResponse.data.messages ?? []
+    server.log.info({ count: gmailMessages.length }, 'Found recent Gmail message IDs')
+
+    const messages = [] as Array<{
+      id: string
+      from: string | null
+      subject: string | null
+      date: string | null
+      snippet: string | null
+    }>
+
+    for (const messageMeta of gmailMessages) {
+      if (!messageMeta.id) {
+        continue
+      }
+
+      const messageResponse = await gmail.users.messages.get({
+        userId: 'me',
+        id: messageMeta.id,
+      })
+
+      const payload = messageResponse.data.payload
+      const headers = payload?.headers ?? []
+      const headerMap = new Map<string, string>()
+
+      for (const header of headers) {
+        if (header.name && header.value) {
+          headerMap.set(header.name, header.value)
+        }
+      }
+
+      messages.push({
+        id: messageResponse.data.id ?? messageMeta.id,
+        from: headerMap.get('From') ?? null,
+        subject: headerMap.get('Subject') ?? null,
+        date: headerMap.get('Date') ?? null,
+        snippet: messageResponse.data.snippet ?? null,
+      })
+    }
+
+    return { messages }
+  } catch (error) {
+    server.log.error({ error }, 'Error fetching Gmail messages')
+    return reply.status(500).send({ success: false, message: 'Failed to read Gmail messages' })
   }
 })
 
