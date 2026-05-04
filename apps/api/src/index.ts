@@ -238,6 +238,86 @@ server.get('/dev/gmail/messages', async (request, reply) => {
   }
 })
 
+server.post('/dev/pubsub', async (request, reply) => {
+  try {
+    const body = request.body as { message?: { data?: string } }
+    if (!body.message?.data) {
+      server.log.warn({ body }, 'Invalid PubSub message format')
+      return reply.status(400).send({ success: false, message: 'Invalid message format' })
+    }
+
+    const decoded = JSON.parse(
+      Buffer.from(body.message.data, 'base64').toString()
+    )
+
+    const { emailAddress, historyId } = decoded
+    server.log.info({ emailAddress, historyId }, 'Received PubSub event')
+
+    // TODO: Process the event (e.g., fetch new history, update DB)
+
+    return reply.status(200).send({ success: true })
+  } catch (error) {
+    server.log.error({ error }, 'Error processing PubSub event')
+    return reply.status(500).send({ success: false, message: 'Failed to process PubSub event' })
+  }
+})
+
+server.post('/dev/gmail/watch', async (request, reply) => {
+  server.log.info('Registering Gmail watch for connected account')
+
+  try {
+    const emailAccount = await prisma.emailAccount.findFirst({
+      where: {
+        provider: 'GMAIL',
+        status: 'CONNECTED',
+      },
+    })
+
+    if (!emailAccount) {
+      server.log.warn('No connected Gmail EmailAccount found')
+      return reply.status(404).send({ success: false, message: 'No connected Gmail account found' })
+    }
+
+    const gmail = await getAuthenticatedGmailClient(emailAccount.id)
+    const watchResponse = await gmail.users.watch({
+      userId: 'me',
+      requestBody: {
+        topicName: 'projects/vinya-prod/topics/gmail-events',
+      },
+    })
+
+    const historyId = watchResponse.data.historyId
+    const expiration = watchResponse.data.expiration
+
+    if (historyId && expiration) {
+      await prisma.emailAccount.update({
+        where: { id: emailAccount.id },
+        data: {
+          gmailHistoryId: historyId,
+          watchExpiration: new Date(parseInt(expiration)),
+        },
+      })
+
+      server.log.info(
+        { emailAccountId: emailAccount.id, historyId, expiration },
+        'Gmail watch registered and saved to DB'
+      )
+    } else {
+      server.log.warn({ watchResponse: watchResponse.data }, 'Gmail watch response missing historyId or expiration')
+    }
+
+    return {
+      success: true,
+      emailAccountId: emailAccount.id,
+      historyId,
+      expiration,
+    }
+  } catch (error) {
+    server.log.error({ error }, 'Error registering Gmail watch')
+    return reply.status(500).send({ success: false, message: 'Failed to register Gmail watch' })
+  }
+})
+
 server.post('/dev/seed', async () => {
   const tenantName = 'Seed Tenant'
   const email = 'seed@example.com'
