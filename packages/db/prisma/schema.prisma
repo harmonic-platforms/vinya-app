@@ -67,6 +67,7 @@ model EmailAccount {
   lastPolledAt     DateTime?
   lastSyncedAt     DateTime?
   gmailCredential  GmailCredential?
+  inboundMessages  InboundMessage[]
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
 
@@ -83,6 +84,20 @@ model GmailCredential {
   scopes                String[]
   createdAt             DateTime     @default(now())
   updatedAt             DateTime     @updatedAt
+}
+
+model InboundMessage {
+  id             String      @id @default(uuid())
+  emailAccount   EmailAccount @relation(fields: [emailAccountId], references: [id])
+  emailAccountId String
+  gmailMessageId String      @unique
+  threadId       String
+  from           String?
+  subject        String?
+  snippet        String?
+  receivedAt     DateTime?
+  rawHeaders     Json?
+  createdAt      DateTime    @default(now())
 }
 
 model CrmIntegration {

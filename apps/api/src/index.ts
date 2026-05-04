@@ -1,8 +1,23 @@
 import Fastify from 'fastify'
 import { google } from 'googleapis'
+import { Prisma } from '@prisma/client'
 import { prisma } from '@vinya/db'
 
 const server = Fastify({ logger: true })
+
+const handleStdPipeErrors = () => {
+  const handleError = (error: NodeJS.ErrnoException) => {
+    if (error?.code === 'EPIPE') {
+      server.log.warn({ code: error.code, syscall: error.syscall }, 'STDOUT/STDERR EPIPE received; exiting gracefully')
+      process.exit(0)
+    }
+  }
+
+  process.stdout.on('error', handleError)
+  process.stderr.on('error', handleError)
+}
+
+handleStdPipeErrors()
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET
@@ -57,6 +72,96 @@ const getAuthenticatedGmailClient = async (emailAccountId: string) => {
   })
 
   return google.gmail({ version: 'v1', auth: oauth2Client })
+}
+
+const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) => {
+  server.log.info({ emailAccountId, newHistoryId }, 'Starting Gmail history sync')
+
+  const emailAccount = await prisma.emailAccount.findUnique({
+    where: { id: emailAccountId },
+  })
+
+  if (!emailAccount) {
+    throw new Error('EmailAccount not found')
+  }
+
+  const previousHistoryId = emailAccount.gmailHistoryId
+  if (!previousHistoryId) {
+    server.log.info({ emailAccountId, newHistoryId }, 'No previous history ID, storing newHistoryId only')
+    await prisma.emailAccount.update({
+      where: { id: emailAccountId },
+      data: { gmailHistoryId: newHistoryId },
+    })
+    return { messageCount: 0, messageIds: [] as string[] }
+  }
+
+  const gmail = await getAuthenticatedGmailClient(emailAccountId)
+  const historyResponse = await gmail.users.history.list({
+    userId: 'me',
+    startHistoryId: previousHistoryId,
+  })
+
+  const historyRecords = historyResponse.data.history ?? []
+  const messageIds = new Set<string>()
+
+  for (const record of historyRecords) {
+    const added = record.messagesAdded ?? []
+    for (const item of added) {
+      const messageId = item.message?.id
+      if (messageId) {
+        messageIds.add(messageId)
+      }
+    }
+  }
+
+  const uniqueMessageIds = Array.from(messageIds)
+  server.log.info({ count: uniqueMessageIds.length, messageIds: uniqueMessageIds }, 'Messages found in history records')
+
+  for (const messageId of uniqueMessageIds) {
+    const messageResponse = await gmail.users.messages.get({
+      userId: 'me',
+      id: messageId,
+    })
+
+    const payload = messageResponse.data.payload
+    const headers = payload?.headers ?? []
+    const headerMap = new Map<string, string>()
+    for (const header of headers) {
+      if (header.name && header.value) {
+        headerMap.set(header.name, header.value)
+      }
+    }
+
+    await prisma.inboundMessage.upsert({
+      where: { gmailMessageId: messageId },
+      update: {
+        threadId: messageResponse.data.threadId ?? '',
+        from: headerMap.get('From') ?? null,
+        subject: headerMap.get('Subject') ?? null,
+        snippet: messageResponse.data.snippet ?? null,
+        receivedAt: headerMap.get('Date') ? new Date(headerMap.get('Date')!) : null,
+        rawHeaders: headers as unknown as Prisma.InputJsonValue,
+      },
+      create: {
+        emailAccountId,
+        gmailMessageId: messageId,
+        threadId: messageResponse.data.threadId ?? '',
+        from: headerMap.get('From') ?? null,
+        subject: headerMap.get('Subject') ?? null,
+        snippet: messageResponse.data.snippet ?? null,
+        receivedAt: headerMap.get('Date') ? new Date(headerMap.get('Date')!) : null,
+        rawHeaders: headers as unknown as Prisma.InputJsonValue,
+      },
+    })
+  }
+
+  await prisma.emailAccount.update({
+    where: { id: emailAccountId },
+    data: { gmailHistoryId: newHistoryId },
+  })
+
+  server.log.info({ emailAccountId, newHistoryId }, 'Updated email account history ID after sync')
+  return { messageCount: uniqueMessageIds.length, messageIds: uniqueMessageIds }
 }
 
 server.get('/health', async () => {
@@ -248,14 +353,33 @@ server.post('/dev/pubsub', async (request, reply) => {
 
     const decoded = JSON.parse(
       Buffer.from(body.message.data, 'base64').toString()
-    )
+    ) as { emailAddress?: string; historyId?: string }
 
-    const { emailAddress, historyId } = decoded
-    server.log.info({ emailAddress, historyId }, 'Received PubSub event')
+    const emailAddress = decoded.emailAddress
+    const historyId = decoded.historyId
+    request.log.info({ emailAddress, historyId }, 'Received PubSub event')
 
-    // TODO: Process the event (e.g., fetch new history, update DB)
+    if (!emailAddress || !historyId) {
+      request.log.warn({ emailAddress, historyId }, 'PubSub event missing emailAddress or historyId')
+      return reply.status(400).send({ success: false, message: 'Missing emailAddress or historyId' })
+    }
 
-    return reply.status(200).send({ success: true })
+    const emailAccount = await prisma.emailAccount.findFirst({
+      where: {
+        provider: 'GMAIL',
+        emailAddress,
+      },
+    })
+
+    if (!emailAccount) {
+      request.log.warn({ emailAddress }, 'No connected Gmail EmailAccount found for PubSub event')
+      return reply.status(404).send({ success: false, message: 'Email account not found' })
+    }
+
+    const syncResult = await syncGmailHistory(emailAccount.id, String(historyId))
+    server.log.info({ syncResult }, 'Completed Gmail history sync for PubSub event')
+
+    return reply.status(200).send({ success: true, ...syncResult })
   } catch (error) {
     server.log.error({ error }, 'Error processing PubSub event')
     return reply.status(500).send({ success: false, message: 'Failed to process PubSub event' })
@@ -303,7 +427,7 @@ server.post('/dev/gmail/watch', async (request, reply) => {
         'Gmail watch registered and saved to DB'
       )
     } else {
-      server.log.warn({ watchResponse: watchResponse.data }, 'Gmail watch response missing historyId or expiration')
+      server.log.warn({ emailAccountId: emailAccount.id, historyId, expiration }, 'Gmail watch response missing historyId or expiration')
     }
 
     return {
