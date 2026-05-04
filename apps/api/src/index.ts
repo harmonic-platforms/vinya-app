@@ -38,6 +38,89 @@ server.post('/dev/seed', async () => {
   }
 })
 
+server.post('/dev/seed-integrations', async () => {
+  const tenantName = 'Seed Tenant'
+  const emailAddress = 'seed@gmail.com'
+
+  let tenant = await prisma.tenant.findFirst({
+    where: { name: tenantName },
+  })
+
+  if (!tenant) {
+    tenant = await prisma.tenant.create({
+      data: { name: tenantName },
+    })
+  }
+
+  const emailAccount = await prisma.emailAccount.upsert({
+    where: {
+      tenantId_provider_emailAddress: {
+        tenantId: tenant.id,
+        provider: 'GMAIL',
+        emailAddress,
+      },
+    },
+    update: {
+      status: 'DISCONNECTED',
+    },
+    create: {
+      tenantId: tenant.id,
+      provider: 'GMAIL',
+      emailAddress,
+      status: 'DISCONNECTED',
+    },
+  })
+
+  const gmailCredential = await prisma.gmailCredential.upsert({
+    where: {
+      emailAccountId: emailAccount.id,
+    },
+    update: {
+      encryptedAccessToken: 'fake-access-token',
+      encryptedRefreshToken: 'fake-refresh-token',
+      tokenExpiresAt: new Date(Date.now() + 1000 * 60 * 60),
+      scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
+    },
+    create: {
+      emailAccountId: emailAccount.id,
+      encryptedAccessToken: 'fake-access-token',
+      encryptedRefreshToken: 'fake-refresh-token',
+      tokenExpiresAt: new Date(Date.now() + 1000 * 60 * 60),
+      scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
+    },
+  })
+
+  const crmIntegration = await prisma.crmIntegration.upsert({
+    where: {
+      tenantId_provider: {
+        tenantId: tenant.id,
+        provider: 'CLOSE',
+      },
+    },
+    update: {
+      status: 'DISCONNECTED',
+      encryptedAccessToken: 'fake-crm-access-token',
+      encryptedRefreshToken: 'fake-crm-refresh-token',
+      accountName: 'Seed Close Account',
+    },
+    create: {
+      tenantId: tenant.id,
+      provider: 'CLOSE',
+      status: 'DISCONNECTED',
+      accountName: 'Seed Close Account',
+      encryptedAccessToken: 'fake-crm-access-token',
+      encryptedRefreshToken: 'fake-crm-refresh-token',
+    },
+  })
+
+  return {
+    tenant,
+    emailAccount,
+    gmailCredential,
+    crmIntegration,
+  }
+})
+
 server.get('/dev/tenants', async () => {
   const tenants = await prisma.tenant.findMany({
     include: {
@@ -60,6 +143,42 @@ server.get('/dev/tenants', async () => {
       createdAt: membership.user.createdAt,
       role: membership.role,
     })),
+  }))
+})
+
+server.get('/dev/integrations', async () => {
+  const tenants = await prisma.tenant.findMany({
+    include: {
+      emailAccounts: {
+        include: {
+          gmailCredential: true,
+        },
+      },
+      crmIntegrations: true,
+    },
+  })
+
+  return tenants.map((tenant) => ({
+    id: tenant.id,
+    name: tenant.name,
+    createdAt: tenant.createdAt,
+    updatedAt: tenant.updatedAt,
+    emailAccounts: tenant.emailAccounts.map((account) => ({
+      id: account.id,
+      provider: account.provider,
+      emailAddress: account.emailAddress,
+      status: account.status,
+      gmailCredential: account.gmailCredential
+        ? {
+            id: account.gmailCredential.id,
+            encryptedAccessToken: account.gmailCredential.encryptedAccessToken,
+            encryptedRefreshToken: account.gmailCredential.encryptedRefreshToken,
+            tokenExpiresAt: account.gmailCredential.tokenExpiresAt,
+            scopes: account.gmailCredential.scopes,
+          }
+        : null,
+    })),
+    crmIntegrations: tenant.crmIntegrations,
   }))
 })
 

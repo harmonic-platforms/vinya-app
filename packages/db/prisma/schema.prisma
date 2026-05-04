@@ -7,6 +7,22 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+enum EmailProvider {
+  GMAIL
+}
+
+enum CrmProvider {
+  CLOSE
+  HUBSPOT
+}
+
+enum IntegrationStatus {
+  CONNECTED
+  DISCONNECTED
+  ERROR
+  NEEDS_REAUTH
+}
+
 model Tenant {
   id              String           @id @default(uuid())
   name            String
@@ -40,21 +56,48 @@ model Membership {
 }
 
 model EmailAccount {
-  id        String   @id @default(uuid())
-  provider  String
-  email     String   @unique
-  tenant    Tenant   @relation(fields: [tenantId], references: [id])
-  tenantId  String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id               String            @id @default(uuid())
+  tenant           Tenant            @relation(fields: [tenantId], references: [id])
+  tenantId         String
+  provider         EmailProvider
+  emailAddress     String
+  status           IntegrationStatus @default(DISCONNECTED)
+  gmailHistoryId   String?
+  watchExpiration  DateTime?
+  lastPolledAt     DateTime?
+  lastSyncedAt     DateTime?
+  gmailCredential  GmailCredential?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  @@unique([tenantId, provider, emailAddress])
+}
+
+model GmailCredential {
+  id                    String       @id @default(uuid())
+  emailAccount          EmailAccount @relation(fields: [emailAccountId], references: [id])
+  emailAccountId        String       @unique
+  encryptedAccessToken  String?
+  encryptedRefreshToken String?
+  tokenExpiresAt        DateTime?
+  scopes                String[]
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
 }
 
 model CrmIntegration {
-  id         String   @id @default(uuid())
-  provider   String
-  externalId String
-  tenant     Tenant   @relation(fields: [tenantId], references: [id])
-  tenantId   String
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  id                  String            @id @default(uuid())
+  tenant              Tenant            @relation(fields: [tenantId], references: [id])
+  tenantId            String
+  provider            CrmProvider
+  status              IntegrationStatus @default(DISCONNECTED)
+  accountName         String?
+  encryptedAccessToken  String?
+  encryptedRefreshToken String?
+  tokenExpiresAt        DateTime?
+  config              Json?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@unique([tenantId, provider])
 }
