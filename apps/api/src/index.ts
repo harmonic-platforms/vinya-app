@@ -1,10 +1,137 @@
 import Fastify from 'fastify'
+import { google } from 'googleapis'
 import { prisma } from '@vinya/db'
 
 const server = Fastify({ logger: true })
 
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI
+const OAUTH_SCOPE = ['https://www.googleapis.com/auth/gmail.readonly']
+const SEED_TENANT_NAME = 'Seed Tenant'
+
+const createGoogleOAuthClient = () => {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI) {
+    throw new Error(
+      'Missing Google OAuth env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI',
+    )
+  }
+
+  return new google.auth.OAuth2({
+    clientId: GOOGLE_CLIENT_ID,
+    clientSecret: GOOGLE_CLIENT_SECRET,
+    redirectUri: GOOGLE_REDIRECT_URI,
+  })
+}
+
 server.get('/health', async () => {
   return { status: 'ok' }
+})
+
+server.get('/auth/google', async (_request, reply) => {
+  server.log.info('Generating Google OAuth consent screen URL')
+
+  const oauth2Client = createGoogleOAuthClient()
+  const authUrl = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    prompt: 'consent',
+    scope: OAUTH_SCOPE,
+  })
+
+  server.log.info({ authUrl }, 'Redirecting to Google OAuth URL')
+  return reply.redirect(authUrl)
+})
+
+server.get('/auth/google/callback', async (request, reply) => {
+  const query = request.query as { code?: string }
+  const code = String(query.code ?? '')
+
+  if (!code) {
+    server.log.warn({ query }, 'Missing code in Google OAuth callback')
+    return reply.status(400).send({ success: false, message: 'Missing OAuth code' })
+  }
+
+  server.log.info({ code: '[REDACTED]' }, 'Received Google OAuth callback code')
+
+  try {
+    const oauth2Client = createGoogleOAuthClient()
+    const tokenResponse = await oauth2Client.getToken(code)
+
+    const tokens = tokenResponse.tokens
+    oauth2Client.setCredentials(tokens)
+
+    const gmail = google.gmail({ version: 'v1', auth: oauth2Client })
+    const profileResponse = await gmail.users.getProfile({ userId: 'me' })
+
+    const emailAddress = profileResponse.data.emailAddress
+    if (!emailAddress) {
+      server.log.error({ profile: profileResponse.data }, 'Google profile did not return an email address')
+      return reply.status(500).send({ success: false, message: 'Could not determine Gmail address' })
+    }
+
+    server.log.info({ emailAddress }, 'Fetched Gmail profile email address')
+
+    let tenant = await prisma.tenant.findFirst({ where: { name: SEED_TENANT_NAME } })
+    if (!tenant) {
+      server.log.info({ tenantName: SEED_TENANT_NAME }, 'Seed tenant not found, creating new tenant')
+      tenant = await prisma.tenant.create({ data: { name: SEED_TENANT_NAME } })
+    }
+
+    const emailAccount = await prisma.emailAccount.upsert({
+      where: {
+        tenantId_provider_emailAddress: {
+          tenantId: tenant.id,
+          provider: 'GMAIL',
+          emailAddress,
+        },
+      },
+      update: {
+        status: 'CONNECTED',
+      },
+      create: {
+        tenantId: tenant.id,
+        provider: 'GMAIL',
+        emailAddress,
+        status: 'CONNECTED',
+      },
+    })
+
+    const tokenExpiresAt = tokens.expiry_date ? new Date(tokens.expiry_date) : null
+    const gmailCredential = await prisma.gmailCredential.upsert({
+      where: {
+        emailAccountId: emailAccount.id,
+      },
+      update: {
+        encryptedAccessToken: tokens.access_token ?? null,
+        encryptedRefreshToken: tokens.refresh_token ?? null,
+        tokenExpiresAt,
+        scopes: OAUTH_SCOPE,
+      },
+      create: {
+        emailAccountId: emailAccount.id,
+        encryptedAccessToken: tokens.access_token ?? null,
+        encryptedRefreshToken: tokens.refresh_token ?? null,
+        tokenExpiresAt,
+        scopes: OAUTH_SCOPE,
+      },
+    })
+
+    server.log.info(
+      { tenantId: tenant.id, emailAccountId: emailAccount.id, gmailCredentialId: gmailCredential.id },
+      'Saved Gmail credentials for seed tenant',
+    )
+
+    return {
+      success: true,
+      tenantId: tenant.id,
+      emailAddress,
+      emailAccountId: emailAccount.id,
+      gmailCredentialId: gmailCredential.id,
+    }
+  } catch (error) {
+    server.log.error({ error }, 'Error during Gmail OAuth callback processing')
+    return reply.status(500).send({ success: false, message: 'Gmail OAuth callback failed' })
+  }
 })
 
 server.post('/dev/seed', async () => {

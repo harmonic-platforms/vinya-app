@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@vinya/db": "file:../../packages/db",
-    "fastify": "^5.8.5"
+    "fastify": "^5.8.5",
+    "googleapis": "131.0.0"
   },
   "devDependencies": {
     "typescript": "6.0.3"
