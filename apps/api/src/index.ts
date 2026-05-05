@@ -617,6 +617,33 @@ server.get('/dev/integrations', async () => {
   }))
 })
 
+server.get('/dev/inbound-messages', async (request, reply) => {
+  request.log.info('Fetching recent inbound messages')
+
+  try {
+    const messages = await prisma.inboundMessage.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+      select: {
+        id: true,
+        gmailMessageId: true,
+        threadId: true,
+        from: true,
+        subject: true,
+        snippet: true,
+        receivedAt: true,
+        createdAt: true,
+      },
+    })
+
+    request.log.info({ count: messages.length }, 'Retrieved inbound messages')
+    return { messages }
+  } catch (error) {
+    request.log.error({ error }, 'Error fetching inbound messages')
+    return reply.status(500).send({ success: false, message: 'Failed to fetch inbound messages' })
+  }
+})
+
 const start = async () => {
   try {
     await prisma.$connect()
