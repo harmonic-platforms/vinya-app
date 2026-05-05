@@ -74,6 +74,55 @@ const getAuthenticatedGmailClient = async (emailAccountId: string) => {
   return google.gmail({ version: 'v1', auth: oauth2Client })
 }
 
+const extractEmailBody = (payload: any): { bodyText: string | null; bodyHtml: string | null } => {
+  const decodeBase64Url = (data: string): string => {
+    return Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
+  }
+
+  const extractFromParts = (parts: any[]): { text: string | null; html: string | null } => {
+    let text: string | null = null
+    let html: string | null = null
+
+    for (const part of parts) {
+      if (part.mimeType === 'text/plain' && part.body?.data) {
+        text = decodeBase64Url(part.body.data)
+      } else if (part.mimeType === 'text/html' && part.body?.data) {
+        html = decodeBase64Url(part.body.data)
+      } else if (part.parts) {
+        const subResult = extractFromParts(part.parts)
+        if (!text && subResult.text) text = subResult.text
+        if (!html && subResult.html) html = subResult.html
+      }
+    }
+
+    return { text, html }
+  }
+
+  // Try payload.body.data first
+  if (payload.body?.data) {
+    const decoded = decodeBase64Url(payload.body.data)
+    if (payload.mimeType === 'text/html') {
+      return { bodyText: null, bodyHtml: decoded }
+    } else {
+      return { bodyText: decoded, bodyHtml: null }
+    }
+  }
+
+  // Try multipart payload.parts
+  if (payload.parts) {
+    const { text, html } = extractFromParts(payload.parts)
+    return { bodyText: text, bodyHtml: html }
+  }
+
+  return { bodyText: null, bodyHtml: null }
+}
+
+function extractLabeledField(text: string, label: string): string | null {
+  const regex = new RegExp(`${label}:\\s*([^\\n\\r]+?)(?=\\s+\\w+:\\s*|$)`, "i");
+  const match = text.match(regex);
+  return match?.[1]?.trim() ?? null;
+}
+
 const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) => {
   server.log.info({ emailAccountId, newHistoryId }, 'Starting Gmail history sync')
 
@@ -132,6 +181,8 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
       }
     }
 
+    const { bodyText, bodyHtml } = extractEmailBody(payload)
+
     await prisma.inboundMessage.upsert({
       where: { gmailMessageId: messageId },
       update: {
@@ -139,6 +190,8 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
         from: headerMap.get('From') ?? null,
         subject: headerMap.get('Subject') ?? null,
         snippet: messageResponse.data.snippet ?? null,
+        bodyText,
+        bodyHtml,
         receivedAt: headerMap.get('Date') ? new Date(headerMap.get('Date')!) : null,
         rawHeaders: headers as unknown as Prisma.InputJsonValue,
       },
@@ -149,6 +202,8 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
         from: headerMap.get('From') ?? null,
         subject: headerMap.get('Subject') ?? null,
         snippet: messageResponse.data.snippet ?? null,
+        bodyText,
+        bodyHtml,
         receivedAt: headerMap.get('Date') ? new Date(headerMap.get('Date')!) : null,
         rawHeaders: headers as unknown as Prisma.InputJsonValue,
       },
@@ -162,6 +217,113 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
 
   server.log.info({ emailAccountId, newHistoryId }, 'Updated email account history ID after sync')
   return { messageCount: uniqueMessageIds.length, messageIds: uniqueMessageIds }
+}
+
+const parseLeadFromMessage = (message: {
+  from: string | null
+  subject: string | null
+  snippet: string | null
+  bodyText: string | null
+}) => {
+  const { from, subject, snippet, bodyText } = message
+  const rawText = bodyText || `${subject || ''} ${snippet || ''}`.trim()
+
+  // Determine source
+  let source = 'unknown'
+  if (from?.toLowerCase().includes('realtor.com')) {
+    source = 'realtor'
+  } else if (from?.toLowerCase().includes('zillow')) {
+    source = 'zillow'
+  } else if (rawText.includes('Lead ID:') && rawText.includes('Lead Information:')) {
+    source = 'mortgage_lead_provider'
+  }
+
+  // Extract email - try labeled first, then generic
+  const labeledEmail = extractLabeledField(rawText, "Email");
+  const genericEmailMatch = rawText.match(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/i);
+  const genericEmail = genericEmailMatch ? genericEmailMatch[0] : null;
+  const email = labeledEmail ?? genericEmail;
+
+  // Extract phone - try labeled first, then generic
+  let phone = null
+  const labeledPhoneMatch = rawText.match(/Phone Number:\s*(\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})/i)
+  if (labeledPhoneMatch) {
+    phone = labeledPhoneMatch[1]
+  } else {
+    const genericPhoneMatch = rawText.match(/\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/)
+    if (genericPhoneMatch) {
+      phone = genericPhoneMatch[0]
+    }
+  }
+
+  // Extract name - try labeled first, then generic
+  let name = null
+  const labeledNameMatch = rawText.match(/Lead Name:\s*([^\n]+?)(?=\s+Phone Number:|\s+Email:|$)/i)
+  if (labeledNameMatch) {
+    name = labeledNameMatch[1].trim()
+  } else {
+    const genericNameMatch = rawText.match(/^[A-Z][a-z]+ [A-Z][a-z]+/)
+    if (genericNameMatch) {
+      name = genericNameMatch[0]
+    }
+  }
+
+  // Extract additional labeled fields
+  const creditRating = extractLabeledField(rawText, 'Credit Rating')
+  const propertyCounty = extractLabeledField(rawText, 'Property County')
+  const propertyState = extractLabeledField(rawText, 'Property State')
+  const propertyZip = extractLabeledField(rawText, 'Property Zip')
+  const propertyValue = extractLabeledField(rawText, 'Property Value')
+  const servedInMilitary = extractLabeledField(rawText, 'Served in Military')
+  const bankruptcy = extractLabeledField(rawText, 'Bankruptcy')
+  const loanType = extractLabeledField(rawText, 'Loan Type')
+  const militaryBranch = extractLabeledField(rawText, 'Military Branch')
+  const hasRealEstateAgent = extractLabeledField(rawText, 'Has Real Estate Agent')
+  const downPaymentPercent = extractLabeledField(rawText, 'Down Payment Percent')
+  const propertyType = extractLabeledField(rawText, 'Property Type')
+  const propertyUse = extractLabeledField(rawText, 'Property Use')
+  const loanProduct = extractLabeledField(rawText, 'Loan Product')
+  const employmentStatus = extractLabeledField(rawText, 'Employment Status')
+  const grossIncome = extractLabeledField(rawText, 'Gross Income')
+  const firstTimePurchase = extractLabeledField(rawText, 'First Time purchase')
+  const livingSituation = extractLabeledField(rawText, 'Living Situation')
+  const purchaseStatus = extractLabeledField(rawText, 'Purchase Status')
+  const downPayment = extractLabeledField(rawText, 'Down Payment')
+  const propertyCity = extractLabeledField(rawText, 'Property City')
+
+  // Message fallback to snippet
+  const messageText = snippet || rawText
+
+  return {
+    source,
+    name,
+    email,
+    phone,
+    message: messageText,
+    parseStatus: 'SUCCESS' as const,
+    // Additional extracted fields
+    creditRating,
+    propertyCounty,
+    propertyState,
+    propertyZip,
+    propertyValue,
+    servedInMilitary,
+    bankruptcy,
+    loanType,
+    militaryBranch,
+    hasRealEstateAgent,
+    downPaymentPercent,
+    propertyType,
+    propertyUse,
+    loanProduct,
+    employmentStatus,
+    grossIncome,
+    firstTimePurchase,
+    livingSituation,
+    purchaseStatus,
+    downPayment,
+    propertyCity,
+  }
 }
 
 server.get('/health', async () => {
@@ -305,6 +467,7 @@ server.get('/dev/gmail/messages', async (request, reply) => {
       subject: string | null
       date: string | null
       snippet: string | null
+      bodyText: string | null
     }>
 
     for (const messageMeta of gmailMessages) {
@@ -327,12 +490,15 @@ server.get('/dev/gmail/messages', async (request, reply) => {
         }
       }
 
+      const { bodyText } = extractEmailBody(payload)
+
       messages.push({
         id: messageResponse.data.id ?? messageMeta.id,
         from: headerMap.get('From') ?? null,
         subject: headerMap.get('Subject') ?? null,
         date: headerMap.get('Date') ?? null,
         snippet: messageResponse.data.snippet ?? null,
+        bodyText,
       })
     }
 
@@ -631,6 +797,7 @@ server.get('/dev/inbound-messages', async (request, reply) => {
         from: true,
         subject: true,
         snippet: true,
+        bodyText: true,
         receivedAt: true,
         createdAt: true,
       },
@@ -641,6 +808,113 @@ server.get('/dev/inbound-messages', async (request, reply) => {
   } catch (error) {
     request.log.error({ error }, 'Error fetching inbound messages')
     return reply.status(500).send({ success: false, message: 'Failed to fetch inbound messages' })
+  }
+})
+
+server.post('/dev/parse-message/:id', async (request, reply) => {
+  const { id } = request.params as { id: string }
+  request.log.info({ inboundMessageId: id }, 'Parsing lead from inbound message')
+
+  try {
+    const inboundMessage = await prisma.inboundMessage.findUnique({
+      where: { id },
+      include: { emailAccount: true },
+    })
+
+    if (!inboundMessage) {
+      request.log.warn({ inboundMessageId: id }, 'Inbound message not found')
+      return reply.status(404).send({ success: false, message: 'Inbound message not found' })
+    }
+
+    // Debug logging
+    request.log.info({
+      inboundMessageId: inboundMessage.id,
+      snippet: inboundMessage.snippet,
+      bodyText: inboundMessage.bodyText
+    }, 'Inbound message data before parsing')
+
+    const rawText = inboundMessage.bodyText || inboundMessage.snippet || ""
+    request.log.info({ rawText }, 'Raw text passed to parseLeadFromMessage')
+
+    // Extract email for debugging
+    const labeledEmail = extractLabeledField(rawText, "Email");
+    const genericEmail = rawText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] ?? null;
+
+    const parsedData = parseLeadFromMessage({
+      from: inboundMessage.from,
+      subject: inboundMessage.subject,
+      snippet: inboundMessage.snippet,
+      bodyText: inboundMessage.bodyText,
+    })
+
+    const parsedLead = await prisma.parsedLead.upsert({
+      where: { inboundMessageId: id },
+      update: {
+        source: parsedData.source,
+        name: parsedData.name,
+        email: parsedData.email,
+        phone: parsedData.phone,
+        message: parsedData.message,
+        rawText,
+        parseStatus: parsedData.parseStatus,
+      },
+      create: {
+        emailAccountId: inboundMessage.emailAccountId,
+        inboundMessageId: id,
+        source: parsedData.source,
+        name: parsedData.name,
+        email: parsedData.email,
+        phone: parsedData.phone,
+        message: parsedData.message,
+        rawText,
+        parseStatus: parsedData.parseStatus,
+      },
+    })
+
+    request.log.info({ parsedLeadId: parsedLead.id, parseStatus: parsedData.parseStatus }, 'Parsed and saved lead')
+    return {
+      success: true,
+      parsedLead,
+      debug: {
+        hasBodyText: Boolean(inboundMessage.bodyText),
+        bodyTextLength: inboundMessage.bodyText?.length ?? 0,
+        rawText,
+        labeledEmail,
+        genericEmail
+      }
+    }
+  } catch (error) {
+    request.log.error({ error, inboundMessageId: id }, 'Error parsing lead from message')
+    return reply.status(500).send({ success: false, message: 'Failed to parse lead' })
+  }
+})
+
+server.get('/dev/parsed-leads', async (request, reply) => {
+  request.log.info('Fetching recent parsed leads')
+
+  try {
+    const leads = await prisma.parsedLead.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+      select: {
+        id: true,
+        emailAccountId: true,
+        inboundMessageId: true,
+        source: true,
+        name: true,
+        email: true,
+        phone: true,
+        message: true,
+        parseStatus: true,
+        createdAt: true,
+      },
+    })
+
+    request.log.info({ count: leads.length }, 'Retrieved parsed leads')
+    return { leads }
+  } catch (error) {
+    request.log.error({ error }, 'Error fetching parsed leads')
+    return reply.status(500).send({ success: false, message: 'Failed to fetch parsed leads' })
   }
 })
 

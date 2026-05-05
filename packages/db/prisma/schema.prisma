@@ -95,9 +95,27 @@ model InboundMessage {
   from           String?
   subject        String?
   snippet        String?
+  bodyText       String?
+  bodyHtml       String?
   receivedAt     DateTime?
   rawHeaders     Json?
+  parsedLead     ParsedLead?
   createdAt      DateTime    @default(now())
+}
+
+model ParsedLead {
+  id                String        @id @default(uuid())
+  emailAccountId    String
+  inboundMessage    InboundMessage @relation(fields: [inboundMessageId], references: [id])
+  inboundMessageId  String        @unique
+  source            String
+  name              String?
+  email             String?
+  phone             String?
+  message           String?
+  rawText           String
+  parseStatus       String
+  createdAt         DateTime      @default(now())
 }
 
 model CrmIntegration {
