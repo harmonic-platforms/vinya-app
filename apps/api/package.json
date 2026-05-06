@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@vinya/db": "file:../../packages/db",
+    "axios": "1.16.0",
     "fastify": "^5.8.5",
     "googleapis": "131.0.0"
   },

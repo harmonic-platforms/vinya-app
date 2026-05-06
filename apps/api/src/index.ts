@@ -1,6 +1,7 @@
 import Fastify from 'fastify'
 import { google } from 'googleapis'
-import { Prisma } from '@prisma/client'
+import axios from 'axios'
+import { Prisma, ParsedLead, CrmIntegration } from '@prisma/client'
 import { prisma } from '@vinya/db'
 
 const server = Fastify({ logger: true })
@@ -37,6 +38,46 @@ const createGoogleOAuthClient = () => {
     clientSecret: GOOGLE_CLIENT_SECRET,
     redirectUri: GOOGLE_REDIRECT_URI,
   })
+}
+
+const sendLeadToHubSpot = async (parsedLead: ParsedLead, crmIntegration: CrmIntegration) => {
+  const token = crmIntegration.encryptedAccessToken
+  if (!token) {
+    server.log.error({ parsedLeadId: parsedLead.id }, 'Missing HubSpot access token on CRM integration')
+    return null
+  }
+
+  const nameTokens = parsedLead.name?.trim().split(/\s+/) ?? []
+  const firstname = nameTokens[0] ?? undefined
+  const lastname = nameTokens.length > 1 ? nameTokens.slice(1).join(' ') : undefined
+
+  const properties: Record<string, string> = {}
+  if (firstname) properties.firstname = firstname
+  if (lastname) properties.lastname = lastname
+  if (parsedLead.email) properties.email = parsedLead.email
+  if (parsedLead.phone) properties.phone = parsedLead.phone
+
+  try {
+    const response = await axios.post(
+      'https://api.hubapi.com/crm/v3/objects/contacts',
+      { properties },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+
+    return response.data?.id ?? null
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      server.log.error({ status: error.response?.status, data: error.response?.data }, 'HubSpot contact creation failed')
+    } else {
+      server.log.error({ error }, 'HubSpot contact creation failed')
+    }
+    return null
+  }
 }
 
 const getAuthenticatedGmailClient = async (emailAccountId: string) => {
@@ -916,6 +957,113 @@ server.get('/dev/parsed-leads', async (request, reply) => {
     request.log.error({ error }, 'Error fetching parsed leads')
     return reply.status(500).send({ success: false, message: 'Failed to fetch parsed leads' })
   }
+})
+
+server.post('/dev/push-lead-hubspot/:id', async (request, reply) => {
+  const { id } = request.params as { id: string }
+  request.log.info({ parsedLeadId: id }, 'Pushing parsed lead to HubSpot')
+
+  try {
+    const parsedLead = await prisma.parsedLead.findUnique({ where: { id } })
+    if (!parsedLead) {
+      request.log.warn({ parsedLeadId: id }, 'ParsedLead not found')
+      return reply.status(404).send({ success: false, message: 'ParsedLead not found' })
+    }
+
+    const crmIntegration = await prisma.crmIntegration.findFirst({
+      where: {
+        provider: 'HUBSPOT',
+        status: 'CONNECTED',
+      },
+    })
+
+    if (!crmIntegration) {
+      request.log.warn('No connected HubSpot CRM integration found')
+      return reply.status(404).send({ success: false, message: 'No connected HubSpot integration found' })
+    }
+
+    const hubspotId = await sendLeadToHubSpot(parsedLead, crmIntegration)
+    if (!hubspotId) {
+      return reply.status(500).send({ success: false, message: 'Failed to push lead to HubSpot' })
+    }
+
+    const updatedLead = await prisma.parsedLead.update({
+      where: { id },
+      data: {
+        crmPushed: true,
+        crmProvider: 'HUBSPOT',
+        crmRecordId: hubspotId,
+        crmPushedAt: new Date(),
+      },
+    })
+
+    return { success: true, parsedLead: updatedLead }
+  } catch (error) {
+    request.log.error({ error, parsedLeadId: id }, 'Error pushing parsed lead to HubSpot')
+    return reply.status(500).send({ success: false, message: 'Failed to push lead to HubSpot' })
+  }
+})
+
+server.get('/dev/pushed-leads', async (request, reply) => {
+  request.log.info('Fetching pushed parsed leads')
+
+  try {
+    const pushedLeads = await prisma.parsedLead.findMany({
+      where: { crmPushed: true },
+      orderBy: { createdAt: 'desc' },
+    })
+
+    request.log.info({ count: pushedLeads.length }, 'Retrieved pushed parsed leads')
+    return { leads: pushedLeads }
+  } catch (error) {
+    request.log.error({ error }, 'Error fetching pushed leads')
+    return reply.status(500).send({ success: false, message: 'Failed to fetch pushed leads' })
+  }
+})
+
+server.post('/dev/seed-hubspot-token', async (request, reply) => {
+  if (process.env.NODE_ENV === 'production') {
+    return reply.status(403).send({ success: false, message: 'Not allowed in production' })
+  }
+
+  const body = request.body as { token?: string }
+  const token = body.token?.trim()
+
+  if (!token) {
+    return reply.status(400).send({ success: false, message: 'Missing token' })
+  }
+
+  const tenant = await prisma.tenant.findFirst({
+    where: { name: SEED_TENANT_NAME },
+  })
+
+  if (!tenant) {
+    request.log.warn({ tenantName: SEED_TENANT_NAME }, 'Seed tenant not found')
+    return reply.status(404).send({ success: false, message: 'Seed tenant not found' })
+  }
+
+  const crmIntegration = await prisma.crmIntegration.upsert({
+    where: {
+      tenantId_provider: {
+        tenantId: tenant.id,
+        provider: 'HUBSPOT',
+      },
+    },
+    update: {
+      status: 'CONNECTED',
+      encryptedAccessToken: token,
+      accountName: 'Dev HubSpot',
+    },
+    create: {
+      tenantId: tenant.id,
+      provider: 'HUBSPOT',
+      status: 'CONNECTED',
+      encryptedAccessToken: token,
+      accountName: 'Dev HubSpot',
+    },
+  })
+
+  return { success: true, crmIntegration }
 })
 
 const start = async () => {

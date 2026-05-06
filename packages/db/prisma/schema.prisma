@@ -115,6 +115,10 @@ model ParsedLead {
   message           String?
   rawText           String
   parseStatus       String
+  crmPushed         Boolean       @default(false)
+  crmProvider       String?
+  crmRecordId       String?
+  crmPushedAt       DateTime?
   createdAt         DateTime      @default(now())
 }
 
