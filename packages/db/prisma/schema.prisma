@@ -115,6 +115,9 @@ model ParsedLead {
   message           String?
   rawText           String
   parseStatus       String
+  crmPushStatus     String?
+  crmPushError      String?
+  crmAttemptCount   Int           @default(0)
   crmPushed         Boolean       @default(false)
   crmProvider       String?
   crmRecordId       String?

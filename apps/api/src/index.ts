@@ -177,11 +177,20 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
 
   const previousHistoryId = emailAccount.gmailHistoryId
   if (!previousHistoryId) {
-    server.log.info({ emailAccountId, newHistoryId }, 'No previous history ID, storing newHistoryId only')
-    await prisma.emailAccount.update({
-      where: { id: emailAccountId },
-      data: { gmailHistoryId: newHistoryId },
-    })
+    const currentEmailAccount = await prisma.emailAccount.findUnique({ where: { id: emailAccountId } })
+    const currentHistoryId = currentEmailAccount?.gmailHistoryId ? BigInt(currentEmailAccount.gmailHistoryId) : 0n
+    const incoming = BigInt(newHistoryId)
+
+    if (incoming > currentHistoryId) {
+      await prisma.emailAccount.update({
+        where: { id: emailAccountId },
+        data: { gmailHistoryId: newHistoryId },
+      })
+      server.log.info({ emailAccountId, newHistoryId }, 'Updated monotonic historyId')
+    } else {
+      server.log.info({ emailAccountId, newHistoryId, currentHistoryId: currentHistoryId.toString() }, 'Skipped stale historyId update')
+    }
+
     return { messageCount: 0, messageIds: [] as string[] }
   }
 
@@ -250,76 +259,129 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
       },
     })
 
-    const parsedData = parseLeadFromMessage({
-      from: savedInboundMessage.from,
-      subject: savedInboundMessage.subject,
-      snippet: savedInboundMessage.snippet,
-      bodyText: savedInboundMessage.bodyText,
-    })
-
-    const rawText = savedInboundMessage.bodyText || `${savedInboundMessage.subject || ''} ${savedInboundMessage.snippet || ''}`.trim()
-    const parsedLead = await prisma.parsedLead.upsert({
+    const existingParsedLead = await prisma.parsedLead.findUnique({
       where: { inboundMessageId: savedInboundMessage.id },
-      update: {
-        source: parsedData.source,
-        name: parsedData.name,
-        email: parsedData.email,
-        phone: parsedData.phone,
-        message: parsedData.message,
-        rawText,
-        parseStatus: parsedData.parseStatus,
-      },
-      create: {
-        emailAccountId,
-        inboundMessageId: savedInboundMessage.id,
-        source: parsedData.source,
-        name: parsedData.name,
-        email: parsedData.email,
-        phone: parsedData.phone,
-        message: parsedData.message,
-        rawText,
-        parseStatus: parsedData.parseStatus,
-      },
     })
 
-    server.log.info({ parsedLeadId: parsedLead.id, inboundMessageId: savedInboundMessage.id }, 'Parsed lead created')
+    let parsedLead = existingParsedLead
+    if (parsedLead) {
+      server.log.info({ parsedLeadId: parsedLead.id, inboundMessageId: savedInboundMessage.id }, 'Skipped duplicate parse for inbound message')
+    } else {
+      try {
+        const parsedData = parseLeadFromMessage({
+          from: savedInboundMessage.from,
+          subject: savedInboundMessage.subject,
+          snippet: savedInboundMessage.snippet,
+          bodyText: savedInboundMessage.bodyText,
+        })
 
-    if (parsedLead.parseStatus === 'SUCCESS' && !parsedLead.crmPushed) {
-      const hubspotIntegration = await prisma.crmIntegration.findFirst({
-        where: {
-          provider: 'HUBSPOT',
-          status: 'CONNECTED',
-        },
-      })
+        const rawText = savedInboundMessage.bodyText || `${savedInboundMessage.subject || ''} ${savedInboundMessage.snippet || ''}`.trim()
+        parsedLead = await prisma.parsedLead.create({
+          data: {
+            emailAccountId,
+            inboundMessageId: savedInboundMessage.id,
+            source: parsedData.source,
+            name: parsedData.name,
+            email: parsedData.email,
+            phone: parsedData.phone,
+            message: parsedData.message,
+            rawText,
+            parseStatus: parsedData.parseStatus,
+            crmPushStatus: 'PENDING',
+          },
+        })
 
-      if (hubspotIntegration) {
-        const hubspotId = await sendLeadToHubSpot(parsedLead, hubspotIntegration)
-        if (hubspotId) {
+        server.log.info({ parsedLeadId: parsedLead.id, inboundMessageId: savedInboundMessage.id }, 'Parsed lead created')
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown parse error'
+        await prisma.parsedLead.create({
+          data: {
+            emailAccountId,
+            inboundMessageId: savedInboundMessage.id,
+            source: 'unknown',
+            rawText: savedInboundMessage.bodyText || `${savedInboundMessage.subject || ''} ${savedInboundMessage.snippet || ''}`.trim(),
+            parseStatus: 'FAILED',
+            crmPushStatus: 'FAILED',
+            crmPushError: errorMessage,
+            crmAttemptCount: 0,
+          },
+        })
+        server.log.error({ inboundMessageId: savedInboundMessage.id, error: errorMessage }, 'Failed to parse inbound message')
+        continue
+      }
+    }
+
+    if (parsedLead && parsedLead.parseStatus === 'SUCCESS') {
+      if (parsedLead.crmPushed) {
+        server.log.info({ parsedLeadId: parsedLead.id }, 'Skipped duplicate HubSpot push for parsed lead')
+      } else {
+        try {
+          const hubspotIntegration = await prisma.crmIntegration.findFirst({
+            where: {
+              provider: 'HUBSPOT',
+              status: 'CONNECTED',
+            },
+          })
+
+          if (hubspotIntegration) {
+            const hubspotId = await sendLeadToHubSpot(parsedLead, hubspotIntegration)
+            if (hubspotId) {
+              await prisma.parsedLead.update({
+                where: { id: parsedLead.id },
+                data: {
+                  crmPushed: true,
+                  crmProvider: 'HUBSPOT',
+                  crmRecordId: hubspotId,
+                  crmPushedAt: new Date(),
+                  crmPushStatus: 'SUCCESS',
+                  crmAttemptCount: { increment: 1 },
+                },
+              })
+              server.log.info({ parsedLeadId: parsedLead.id, crmRecordId: hubspotId }, 'Lead pushed to HubSpot')
+            } else {
+              await prisma.parsedLead.update({
+                where: { id: parsedLead.id },
+                data: {
+                  crmPushStatus: 'FAILED',
+                  crmAttemptCount: { increment: 1 },
+                  crmPushError: 'HubSpot push returned no contact id',
+                },
+              })
+              server.log.error({ parsedLeadId: parsedLead.id }, 'Failed to push parsed lead to HubSpot: no contact id returned')
+            }
+          } else {
+            server.log.info({ parsedLeadId: parsedLead.id }, 'No connected HubSpot integration found; skipping push')
+          }
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : 'Unknown HubSpot push error'
           await prisma.parsedLead.update({
             where: { id: parsedLead.id },
             data: {
-              crmPushed: true,
-              crmProvider: 'HUBSPOT',
-              crmRecordId: hubspotId,
-              crmPushedAt: new Date(),
+              crmPushStatus: 'FAILED',
+              crmAttemptCount: { increment: 1 },
+              crmPushError: errorMessage,
             },
           })
-          server.log.info({ parsedLeadId: parsedLead.id, crmRecordId: hubspotId }, 'Lead pushed to HubSpot')
-        } else {
-          server.log.error({ parsedLeadId: parsedLead.id }, 'Failed to push parsed lead to HubSpot')
+          server.log.error({ parsedLeadId: parsedLead.id, error: errorMessage }, 'Error pushing parsed lead to HubSpot')
         }
-      } else {
-        server.log.info({ parsedLeadId: parsedLead.id }, 'No connected HubSpot integration found; skipping push')
       }
     }
   }
 
-  await prisma.emailAccount.update({
-    where: { id: emailAccountId },
-    data: { gmailHistoryId: newHistoryId },
-  })
+  const currentEmailAccount = await prisma.emailAccount.findUnique({ where: { id: emailAccountId } })
+  const currentHistoryId = currentEmailAccount?.gmailHistoryId ? BigInt(currentEmailAccount.gmailHistoryId) : 0n
+  const incoming = BigInt(newHistoryId)
 
-  server.log.info({ emailAccountId, newHistoryId }, 'Updated email account history ID after sync')
+  if (incoming > currentHistoryId) {
+    await prisma.emailAccount.update({
+      where: { id: emailAccountId },
+      data: { gmailHistoryId: newHistoryId },
+    })
+    server.log.info({ emailAccountId, newHistoryId }, 'Updated monotonic historyId')
+  } else {
+    server.log.info({ emailAccountId, newHistoryId, currentHistoryId: currentHistoryId.toString() }, 'Skipped stale historyId update')
+  }
+
   return { messageCount: uniqueMessageIds.length, messageIds: uniqueMessageIds }
 }
 
@@ -1064,6 +1126,86 @@ server.post('/dev/push-lead-hubspot/:id', async (request, reply) => {
   } catch (error) {
     request.log.error({ error, parsedLeadId: id }, 'Error pushing parsed lead to HubSpot')
     return reply.status(500).send({ success: false, message: 'Failed to push lead to HubSpot' })
+  }
+})
+
+server.post('/dev/retry-failed-leads', async (request, reply) => {
+  request.log.info('Retrying failed HubSpot pushes for parsed leads')
+
+  try {
+    const crmIntegration = await prisma.crmIntegration.findFirst({
+      where: {
+        provider: 'HUBSPOT',
+        status: 'CONNECTED',
+      },
+    })
+
+    if (!crmIntegration) {
+      request.log.warn('No connected HubSpot CRM integration found')
+      return reply.status(404).send({ success: false, message: 'No connected HubSpot integration found' })
+    }
+
+    const failedLeads = await prisma.parsedLead.findMany({
+      where: { crmPushStatus: 'FAILED' },
+    })
+
+    const results = [] as Array<{ id: string; success: boolean; message: string }>
+
+    for (const lead of failedLeads) {
+      if (lead.crmPushed) {
+        request.log.info({ parsedLeadId: lead.id }, 'Skipping already pushed lead during retry')
+        results.push({ id: lead.id, success: true, message: 'Already pushed' })
+        continue
+      }
+
+      try {
+        const hubspotId = await sendLeadToHubSpot(lead, crmIntegration)
+        if (hubspotId) {
+          await prisma.parsedLead.update({
+            where: { id: lead.id },
+            data: {
+              crmPushed: true,
+              crmProvider: 'HUBSPOT',
+              crmRecordId: hubspotId,
+              crmPushedAt: new Date(),
+              crmPushStatus: 'SUCCESS',
+              crmAttemptCount: { increment: 1 },
+              crmPushError: null,
+            },
+          })
+          request.log.info({ parsedLeadId: lead.id, crmRecordId: hubspotId }, 'Retried HubSpot push succeeded')
+          results.push({ id: lead.id, success: true, message: 'Retried successfully' })
+        } else {
+          await prisma.parsedLead.update({
+            where: { id: lead.id },
+            data: {
+              crmPushStatus: 'FAILED',
+              crmAttemptCount: { increment: 1 },
+              crmPushError: 'HubSpot push returned no contact id',
+            },
+          })
+          request.log.error({ parsedLeadId: lead.id }, 'Retry HubSpot push failed: no contact id')
+          results.push({ id: lead.id, success: false, message: 'No contact id returned' })
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown HubSpot push error'
+        await prisma.parsedLead.update({
+          where: { id: lead.id },
+          data: {
+            crmPushStatus: 'FAILED',
+            crmAttemptCount: { increment: 1 },
+            crmPushError: errorMessage,
+          },
+        })
+        request.log.error({ parsedLeadId: lead.id, error: errorMessage }, 'Retry HubSpot push error')
+        results.push({ id: lead.id, success: false, message: errorMessage })
+      }
+    }
+
+    return { success: true, results }
+  } catch (error) {
+    request.log.error({ error }, 'Error retrying failed HubSpot pushes')
+    return reply.status(500).send({ success: false, message: 'Failed to retry failed leads' })
   }
 })
 
