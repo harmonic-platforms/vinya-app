@@ -224,7 +224,7 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
 
     const { bodyText, bodyHtml } = extractEmailBody(payload)
 
-    await prisma.inboundMessage.upsert({
+    const savedInboundMessage = await prisma.inboundMessage.upsert({
       where: { gmailMessageId: messageId },
       update: {
         threadId: messageResponse.data.threadId ?? '',
@@ -249,6 +249,69 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
         rawHeaders: headers as unknown as Prisma.InputJsonValue,
       },
     })
+
+    const parsedData = parseLeadFromMessage({
+      from: savedInboundMessage.from,
+      subject: savedInboundMessage.subject,
+      snippet: savedInboundMessage.snippet,
+      bodyText: savedInboundMessage.bodyText,
+    })
+
+    const rawText = savedInboundMessage.bodyText || `${savedInboundMessage.subject || ''} ${savedInboundMessage.snippet || ''}`.trim()
+    const parsedLead = await prisma.parsedLead.upsert({
+      where: { inboundMessageId: savedInboundMessage.id },
+      update: {
+        source: parsedData.source,
+        name: parsedData.name,
+        email: parsedData.email,
+        phone: parsedData.phone,
+        message: parsedData.message,
+        rawText,
+        parseStatus: parsedData.parseStatus,
+      },
+      create: {
+        emailAccountId,
+        inboundMessageId: savedInboundMessage.id,
+        source: parsedData.source,
+        name: parsedData.name,
+        email: parsedData.email,
+        phone: parsedData.phone,
+        message: parsedData.message,
+        rawText,
+        parseStatus: parsedData.parseStatus,
+      },
+    })
+
+    server.log.info({ parsedLeadId: parsedLead.id, inboundMessageId: savedInboundMessage.id }, 'Parsed lead created')
+
+    if (parsedLead.parseStatus === 'SUCCESS' && !parsedLead.crmPushed) {
+      const hubspotIntegration = await prisma.crmIntegration.findFirst({
+        where: {
+          provider: 'HUBSPOT',
+          status: 'CONNECTED',
+        },
+      })
+
+      if (hubspotIntegration) {
+        const hubspotId = await sendLeadToHubSpot(parsedLead, hubspotIntegration)
+        if (hubspotId) {
+          await prisma.parsedLead.update({
+            where: { id: parsedLead.id },
+            data: {
+              crmPushed: true,
+              crmProvider: 'HUBSPOT',
+              crmRecordId: hubspotId,
+              crmPushedAt: new Date(),
+            },
+          })
+          server.log.info({ parsedLeadId: parsedLead.id, crmRecordId: hubspotId }, 'Lead pushed to HubSpot')
+        } else {
+          server.log.error({ parsedLeadId: parsedLead.id }, 'Failed to push parsed lead to HubSpot')
+        }
+      } else {
+        server.log.info({ parsedLeadId: parsedLead.id }, 'No connected HubSpot integration found; skipping push')
+      }
+    }
   }
 
   await prisma.emailAccount.update({
