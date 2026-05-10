@@ -164,16 +164,22 @@ function extractLabeledField(text: string, label: string): string | null {
   return match?.[1]?.trim() ?? null;
 }
 
-const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) => {
-  server.log.info({ emailAccountId, newHistoryId }, 'Starting Gmail history sync')
+const isEligibleLeadMessage = (from: string | null, subject: string | null): boolean => {
+  return from !== null && from.includes('mikeroit@gmail.com') && subject === 'New Lead'
+}
 
+const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) => {
   const emailAccount = await prisma.emailAccount.findUnique({
     where: { id: emailAccountId },
+    include: { tenant: true },
   })
 
   if (!emailAccount) {
     throw new Error('EmailAccount not found')
   }
+
+  const tenantId = emailAccount.tenantId
+  server.log.info({ emailAccountId, newHistoryId, tenantId }, 'Starting Gmail history sync for tenant')
 
   const previousHistoryId = emailAccount.gmailHistoryId
   if (!previousHistoryId) {
@@ -186,9 +192,9 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
         where: { id: emailAccountId },
         data: { gmailHistoryId: newHistoryId },
       })
-      server.log.info({ emailAccountId, newHistoryId }, 'Updated monotonic historyId')
+      server.log.info({ emailAccountId, newHistoryId, tenantId }, 'Updated monotonic historyId for tenant')
     } else {
-      server.log.info({ emailAccountId, newHistoryId, currentHistoryId: currentHistoryId.toString() }, 'Skipped stale historyId update')
+      server.log.info({ emailAccountId, newHistoryId, currentHistoryId: currentHistoryId.toString(), tenantId }, 'Skipped stale historyId update for tenant')
     }
 
     return { messageCount: 0, messageIds: [] as string[] }
@@ -214,13 +220,32 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
   }
 
   const uniqueMessageIds = Array.from(messageIds)
-  server.log.info({ count: uniqueMessageIds.length, messageIds: uniqueMessageIds }, 'Messages found in history records')
+  server.log.info({ tenantId, count: uniqueMessageIds.length, messageIds: uniqueMessageIds }, 'Messages found in history records for tenant')
 
   for (const messageId of uniqueMessageIds) {
-    const messageResponse = await gmail.users.messages.get({
-      userId: 'me',
-      id: messageId,
-    })
+    let messageResponse
+    try {
+      messageResponse = await gmail.users.messages.get({
+        userId: 'me',
+        id: messageId,
+      })
+    } catch (error) {
+      const status = (error as any)?.code ?? (error as any)?.response?.status
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      if (status === 404) {
+        server.log.warn({ messageId, emailAccountId, tenantId }, 'Skipping Gmail message not found')
+        continue
+      }
+
+      server.log.error({ messageId, emailAccountId, tenantId, error: errorMessage }, 'Failed to fetch Gmail message')
+      continue
+    }
+
+    const labelIds = messageResponse.data.labelIds ?? []
+    if (!labelIds.includes('INBOX')) {
+      server.log.info({ messageId, emailAccountId, tenantId, labelIds }, 'Skipping non-inbox Gmail message')
+      continue
+    }
 
     const payload = messageResponse.data.payload
     const headers = payload?.headers ?? []
@@ -259,6 +284,13 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
       },
     })
 
+    if (!isEligibleLeadMessage(savedInboundMessage.from, savedInboundMessage.subject)) {
+      server.log.info({ inboundMessageId: savedInboundMessage.id, from: savedInboundMessage.from, subject: savedInboundMessage.subject }, 'Skipping non-lead message')
+      continue
+    } else {
+      server.log.info({ inboundMessageId: savedInboundMessage.id }, 'Eligible lead message detected')
+    }
+
     const existingParsedLead = await prisma.parsedLead.findUnique({
       where: { inboundMessageId: savedInboundMessage.id },
     })
@@ -291,7 +323,7 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
           },
         })
 
-        server.log.info({ parsedLeadId: parsedLead.id, inboundMessageId: savedInboundMessage.id }, 'Parsed lead created')
+        server.log.info({ tenantId, parsedLeadId: parsedLead.id, inboundMessageId: savedInboundMessage.id }, 'Parsed lead created for tenant')
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown parse error'
         await prisma.parsedLead.create({
@@ -316,8 +348,23 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
         server.log.info({ parsedLeadId: parsedLead.id }, 'Skipped duplicate HubSpot push for parsed lead')
       } else {
         try {
+          // Get tenant from email account
+          const emailAccount = await prisma.emailAccount.findUnique({
+            where: { id: emailAccountId },
+            include: { tenant: true },
+          })
+
+          if (!emailAccount) {
+            server.log.error({ emailAccountId }, 'EmailAccount not found during HubSpot push')
+            continue
+          }
+
+          const tenantId = emailAccount.tenantId
+          server.log.info({ tenantId, parsedLeadId: parsedLead.id }, 'Processing HubSpot push for tenant')
+
           const hubspotIntegration = await prisma.crmIntegration.findFirst({
             where: {
+              tenantId,
               provider: 'HUBSPOT',
               status: 'CONNECTED',
             },
@@ -337,7 +384,7 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
                   crmAttemptCount: { increment: 1 },
                 },
               })
-              server.log.info({ parsedLeadId: parsedLead.id, crmRecordId: hubspotId }, 'Lead pushed to HubSpot')
+              server.log.info({ tenantId, parsedLeadId: parsedLead.id, crmRecordId: hubspotId }, 'Lead pushed to HubSpot for tenant')
             } else {
               await prisma.parsedLead.update({
                 where: { id: parsedLead.id },
@@ -347,10 +394,10 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
                   crmPushError: 'HubSpot push returned no contact id',
                 },
               })
-              server.log.error({ parsedLeadId: parsedLead.id }, 'Failed to push parsed lead to HubSpot: no contact id returned')
+              server.log.error({ tenantId, parsedLeadId: parsedLead.id }, 'Failed to push parsed lead to HubSpot: no contact id returned')
             }
           } else {
-            server.log.info({ parsedLeadId: parsedLead.id }, 'No connected HubSpot integration found; skipping push')
+            server.log.info({ tenantId, parsedLeadId: parsedLead.id }, 'No connected HubSpot integration found for tenant; skipping push')
           }
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : 'Unknown HubSpot push error'
@@ -377,9 +424,9 @@ const syncGmailHistory = async (emailAccountId: string, newHistoryId: string) =>
       where: { id: emailAccountId },
       data: { gmailHistoryId: newHistoryId },
     })
-    server.log.info({ emailAccountId, newHistoryId }, 'Updated monotonic historyId')
+    server.log.info({ emailAccountId, newHistoryId, tenantId }, 'Updated monotonic historyId for tenant')
   } else {
-    server.log.info({ emailAccountId, newHistoryId, currentHistoryId: currentHistoryId.toString() }, 'Skipped stale historyId update')
+    server.log.info({ emailAccountId, newHistoryId, currentHistoryId: currentHistoryId.toString(), tenantId }, 'Skipped stale historyId update for tenant')
   }
 
   return { messageCount: uniqueMessageIds.length, messageIds: uniqueMessageIds }
@@ -492,34 +539,124 @@ const parseLeadFromMessage = (message: {
   }
 }
 
-server.get('/health', async () => {
-  return { status: 'ok' }
+server.post('/dev/create-tenant', async (request, reply) => {
+  const body = request.body as { name?: string; email?: string }
+
+  const name = body.name?.trim()
+  const email = body.email?.trim()
+
+  if (!name || !email) {
+    return reply.status(400).send({ success: false, message: 'Missing name or email' })
+  }
+
+  try {
+    server.log.info({ tenantName: name, adminEmail: email }, 'Creating new tenant with admin user')
+
+    const tenant = await prisma.tenant.create({
+      data: { name },
+    })
+
+    const user = await prisma.user.create({
+      data: { email },
+    })
+
+    const membership = await prisma.membership.create({
+      data: {
+        role: 'admin',
+        userId: user.id,
+        tenantId: tenant.id,
+      },
+    })
+
+    server.log.info({ tenantId: tenant.id, userId: user.id, membershipId: membership.id }, 'Created tenant, user, and admin membership')
+
+    return {
+      success: true,
+      tenant: {
+        id: tenant.id,
+        name: tenant.name,
+        createdAt: tenant.createdAt,
+      },
+      user: {
+        id: user.id,
+        email: user.email,
+        createdAt: user.createdAt,
+      },
+      membership: {
+        id: membership.id,
+        role: membership.role,
+        createdAt: membership.createdAt,
+      },
+    }
+  } catch (error) {
+    server.log.error({ error, tenantName: name, adminEmail: email }, 'Error creating tenant')
+    return reply.status(500).send({ success: false, message: 'Failed to create tenant' })
+  }
 })
 
-server.get('/auth/google', async (_request, reply) => {
-  server.log.info('Generating Google OAuth consent screen URL')
+server.get('/auth/google', async (request, reply) => {
+  const query = request.query as { tenantId?: string }
+  const tenantId = query.tenantId?.trim()
+
+  if (!tenantId) {
+    server.log.warn({ query }, 'Missing tenantId in Google OAuth request')
+    return reply.status(400).send({ success: false, message: 'Missing tenantId' })
+  }
+
+  // Verify tenant exists
+  const tenant = await prisma.tenant.findUnique({ where: { id: tenantId } })
+  if (!tenant) {
+    server.log.warn({ tenantId }, 'Tenant not found for Google OAuth')
+    return reply.status(404).send({ success: false, message: 'Tenant not found' })
+  }
+
+  server.log.info({ tenantId }, 'Generating Google OAuth consent screen URL for tenant')
 
   const oauth2Client = createGoogleOAuthClient()
+  const state = JSON.stringify({ tenantId })
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
     scope: OAUTH_SCOPE,
+    state,
   })
 
-  server.log.info({ authUrl }, 'Redirecting to Google OAuth URL')
+  server.log.info({ authUrl, tenantId }, 'Redirecting to Google OAuth URL')
   return reply.redirect(authUrl)
 })
 
 server.get('/auth/google/callback', async (request, reply) => {
-  const query = request.query as { code?: string }
+  const query = request.query as { code?: string; state?: string }
   const code = String(query.code ?? '')
+  const state = query.state
 
   if (!code) {
     server.log.warn({ query }, 'Missing code in Google OAuth callback')
     return reply.status(400).send({ success: false, message: 'Missing OAuth code' })
   }
 
-  server.log.info({ code: '[REDACTED]' }, 'Received Google OAuth callback code')
+  if (!state) {
+    server.log.warn({ query }, 'Missing state in Google OAuth callback')
+    return reply.status(400).send({ success: false, message: 'Missing OAuth state' })
+  }
+
+  let tenantId: string
+  try {
+    const stateData = JSON.parse(state)
+    tenantId = stateData.tenantId
+  } catch (error) {
+    server.log.warn({ state, error }, 'Invalid state format in Google OAuth callback')
+    return reply.status(400).send({ success: false, message: 'Invalid OAuth state' })
+  }
+
+  // Verify tenant exists
+  const tenant = await prisma.tenant.findUnique({ where: { id: tenantId } })
+  if (!tenant) {
+    server.log.warn({ tenantId }, 'Tenant not found for Google OAuth callback')
+    return reply.status(404).send({ success: false, message: 'Tenant not found' })
+  }
+
+  server.log.info({ code: '[REDACTED]', tenantId }, 'Received Google OAuth callback code for tenant')
 
   try {
     const oauth2Client = createGoogleOAuthClient()
@@ -537,18 +674,12 @@ server.get('/auth/google/callback', async (request, reply) => {
       return reply.status(500).send({ success: false, message: 'Could not determine Gmail address' })
     }
 
-    server.log.info({ emailAddress }, 'Fetched Gmail profile email address')
-
-    let tenant = await prisma.tenant.findFirst({ where: { name: SEED_TENANT_NAME } })
-    if (!tenant) {
-      server.log.info({ tenantName: SEED_TENANT_NAME }, 'Seed tenant not found, creating new tenant')
-      tenant = await prisma.tenant.create({ data: { name: SEED_TENANT_NAME } })
-    }
+    server.log.info({ emailAddress, tenantId }, 'Fetched Gmail profile email address for tenant')
 
     const emailAccount = await prisma.emailAccount.upsert({
       where: {
         tenantId_provider_emailAddress: {
-          tenantId: tenant.id,
+          tenantId,
           provider: 'GMAIL',
           emailAddress,
         },
@@ -557,7 +688,7 @@ server.get('/auth/google/callback', async (request, reply) => {
         status: 'CONNECTED',
       },
       create: {
-        tenantId: tenant.id,
+        tenantId,
         provider: 'GMAIL',
         emailAddress,
         status: 'CONNECTED',
@@ -585,19 +716,19 @@ server.get('/auth/google/callback', async (request, reply) => {
     })
 
     server.log.info(
-      { tenantId: tenant.id, emailAccountId: emailAccount.id, gmailCredentialId: gmailCredential.id },
-      'Saved Gmail credentials for seed tenant',
+      { tenantId, emailAccountId: emailAccount.id, gmailCredentialId: gmailCredential.id },
+      'Saved Gmail credentials for tenant',
     )
 
     return {
       success: true,
-      tenantId: tenant.id,
+      tenantId,
       emailAddress,
       emailAccountId: emailAccount.id,
       gmailCredentialId: gmailCredential.id,
     }
   } catch (error) {
-    server.log.error({ error }, 'Error during Gmail OAuth callback processing')
+    server.log.error({ error, tenantId }, 'Error during Gmail OAuth callback processing')
     return reply.status(500).send({ success: false, message: 'Gmail OAuth callback failed' })
   }
 })
@@ -676,100 +807,182 @@ server.get('/dev/gmail/messages', async (request, reply) => {
 })
 
 server.post('/dev/pubsub', async (request, reply) => {
+  const body = request.body as { message?: { data?: string } }
+  if (!body.message?.data) {
+    server.log.warn({ body }, 'Invalid PubSub message format')
+    return reply.status(200).send({ received: false, processed: false, error: 'Invalid message format' })
+  }
+
+  const decoded = JSON.parse(
+    Buffer.from(body.message.data, 'base64').toString()
+  ) as { emailAddress?: string; historyId?: string }
+
+  const emailAddress = decoded.emailAddress
+  const historyId = decoded.historyId
+  request.log.info({ pubsubEvent: decoded }, 'Received PubSub event')
+
+  if (!emailAddress || !historyId) {
+    request.log.warn({ emailAddress, historyId }, 'PubSub event missing emailAddress or historyId')
+    return reply.status(200).send({ received: true, processed: false, error: 'Missing emailAddress or historyId' })
+  }
+
+  const emailAccount = await prisma.emailAccount.findFirst({
+    where: {
+      provider: 'GMAIL',
+      emailAddress,
+    },
+    include: { tenant: true },
+  })
+
+  if (!emailAccount) {
+    request.log.warn({ emailAddress }, 'No connected Gmail EmailAccount found for PubSub event')
+    return reply.status(200).send({ received: true, processed: false, error: 'Email account not found' })
+  }
+
+  const tenantId = emailAccount.tenantId
+  request.log.info({ emailAddress, historyId, tenantId }, 'Processing PubSub event for tenant')
+
   try {
-    const body = request.body as { message?: { data?: string } }
-    if (!body.message?.data) {
-      server.log.warn({ body }, 'Invalid PubSub message format')
-      return reply.status(400).send({ success: false, message: 'Invalid message format' })
-    }
-
-    const decoded = JSON.parse(
-      Buffer.from(body.message.data, 'base64').toString()
-    ) as { emailAddress?: string; historyId?: string }
-
-    const emailAddress = decoded.emailAddress
-    const historyId = decoded.historyId
-    request.log.info({ emailAddress, historyId }, 'Received PubSub event')
-
-    if (!emailAddress || !historyId) {
-      request.log.warn({ emailAddress, historyId }, 'PubSub event missing emailAddress or historyId')
-      return reply.status(400).send({ success: false, message: 'Missing emailAddress or historyId' })
-    }
-
-    const emailAccount = await prisma.emailAccount.findFirst({
-      where: {
-        provider: 'GMAIL',
-        emailAddress,
-      },
-    })
-
-    if (!emailAccount) {
-      request.log.warn({ emailAddress }, 'No connected Gmail EmailAccount found for PubSub event')
-      return reply.status(404).send({ success: false, message: 'Email account not found' })
-    }
-
     const syncResult = await syncGmailHistory(emailAccount.id, String(historyId))
-    server.log.info({ syncResult }, 'Completed Gmail history sync for PubSub event')
-
-    return reply.status(200).send({ success: true, ...syncResult })
+    server.log.info({ tenantId, syncResult }, 'Completed Gmail history sync for PubSub event')
+    return reply.status(200).send({ received: true, processed: true, tenantId, ...syncResult })
   } catch (error) {
-    server.log.error({ error }, 'Error processing PubSub event')
-    return reply.status(500).send({ success: false, message: 'Failed to process PubSub event' })
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    server.log.error({ emailAddress, historyId, error: errorMessage }, 'Error processing PubSub event')
+    return reply.status(200).send({ received: true, processed: false, error: errorMessage })
   }
 })
 
-server.post('/dev/gmail/watch', async (request, reply) => {
-  server.log.info('Registering Gmail watch for connected account')
+const registerGmailWatchForAccount = async (emailAccount: { id: string }) => {
+  const gmail = await getAuthenticatedGmailClient(emailAccount.id)
+  const watchResponse = await gmail.users.watch({
+    userId: 'me',
+    requestBody: {
+      topicName: 'projects/vinya-prod/topics/gmail-events',
+    },
+  })
+
+  const historyId = watchResponse.data.historyId
+  const expiration = watchResponse.data.expiration
+
+  if (!historyId || !expiration) {
+    throw new Error('Gmail watch response missing historyId or expiration')
+  }
+
+  const updatedAccount = await prisma.emailAccount.update({
+    where: { id: emailAccount.id },
+    data: {
+      gmailHistoryId: historyId,
+      watchExpiration: new Date(parseInt(expiration)),
+    },
+  })
+
+  return {
+    emailAccount: updatedAccount,
+    historyId,
+    expiration,
+  }
+}
+
+server.post('/dev/gmail/watch/:emailAccountId', async (request, reply) => {
+  const { emailAccountId } = request.params as { emailAccountId: string }
+
+  if (!emailAccountId) {
+    request.log.warn('Missing emailAccountId in Gmail watch request')
+    return reply.status(400).send({ success: false, message: 'Missing emailAccountId' })
+  }
+
+  server.log.info({ emailAccountId }, 'Registering Gmail watch for EmailAccount ID')
 
   try {
-    const emailAccount = await prisma.emailAccount.findFirst({
-      where: {
-        provider: 'GMAIL',
-        status: 'CONNECTED',
-      },
+    const emailAccount = await prisma.emailAccount.findUnique({
+      where: { id: emailAccountId },
     })
 
     if (!emailAccount) {
-      server.log.warn('No connected Gmail EmailAccount found')
-      return reply.status(404).send({ success: false, message: 'No connected Gmail account found' })
+      request.log.warn({ emailAccountId }, 'EmailAccount not found for Gmail watch')
+      return reply.status(404).send({ success: false, message: 'EmailAccount not found' })
     }
 
-    const gmail = await getAuthenticatedGmailClient(emailAccount.id)
-    const watchResponse = await gmail.users.watch({
-      userId: 'me',
-      requestBody: {
-        topicName: 'projects/vinya-prod/topics/gmail-events',
-      },
-    })
-
-    const historyId = watchResponse.data.historyId
-    const expiration = watchResponse.data.expiration
-
-    if (historyId && expiration) {
-      await prisma.emailAccount.update({
-        where: { id: emailAccount.id },
-        data: {
-          gmailHistoryId: historyId,
-          watchExpiration: new Date(parseInt(expiration)),
-        },
-      })
-
-      server.log.info(
-        { emailAccountId: emailAccount.id, historyId, expiration },
-        'Gmail watch registered and saved to DB'
-      )
-    } else {
-      server.log.warn({ emailAccountId: emailAccount.id, historyId, expiration }, 'Gmail watch response missing historyId or expiration')
+    if (emailAccount.provider !== 'GMAIL' || emailAccount.status !== 'CONNECTED') {
+      request.log.warn({ emailAccountId, provider: emailAccount.provider, status: emailAccount.status }, 'EmailAccount is not a connected Gmail account')
+      return reply.status(400).send({ success: false, message: 'EmailAccount must be a connected Gmail account' })
     }
+
+    const emailAddress = emailAccount.emailAddress
+    const tenantId = emailAccount.tenantId
+    request.log.info({ tenantId, emailAccountId, emailAddress }, 'Found Gmail EmailAccount for watch registration')
+
+    const watchResult = await registerGmailWatchForAccount(emailAccount)
+
+    request.log.info({ tenantId, emailAccountId, emailAddress, historyId: watchResult.historyId, expiration: watchResult.expiration }, 'Gmail watch registered and saved to DB for tenant')
 
     return {
       success: true,
       emailAccountId: emailAccount.id,
-      historyId,
-      expiration,
+      emailAddress,
+      historyId: watchResult.historyId,
+      expiration: watchResult.expiration,
     }
   } catch (error) {
-    server.log.error({ error }, 'Error registering Gmail watch')
+    request.log.error({ error, emailAccountId }, 'Error registering Gmail watch for EmailAccount ID')
+    return reply.status(500).send({ success: false, message: 'Failed to register Gmail watch' })
+  }
+})
+
+server.post('/dev/gmail/watch', async (request, reply) => {
+  const body = (request.body ?? {}) as { tenantId?: string; emailAccountId?: string }
+  const query = (request.query ?? {}) as { tenantId?: string; emailAccountId?: string }
+  const emailAccountId = body.emailAccountId?.trim() || query.emailAccountId?.trim()
+  const tenantId = body.tenantId?.trim() || query.tenantId?.trim()
+
+  if (!emailAccountId && !tenantId) {
+    request.log.warn({ tenantId, emailAccountId }, 'Missing tenantId and emailAccountId in Gmail watch request')
+    return reply.status(400).send({ success: false, message: 'Missing tenantId or emailAccountId' })
+  }
+
+  request.log.info({ tenantId, emailAccountId }, 'Registering Gmail watch via fallback route')
+
+  try {
+    let emailAccount
+    if (emailAccountId) {
+      emailAccount = await prisma.emailAccount.findUnique({ where: { id: emailAccountId } })
+    } else {
+      emailAccount = await prisma.emailAccount.findFirst({
+        where: {
+          provider: 'GMAIL',
+          status: 'CONNECTED',
+          tenantId: tenantId!,
+        },
+      })
+    }
+
+    if (!emailAccount) {
+      request.log.warn({ tenantId, emailAccountId }, 'EmailAccount not found for fallback Gmail watch route')
+      return reply.status(404).send({ success: false, message: 'EmailAccount not found' })
+    }
+
+    if (emailAccount.provider !== 'GMAIL' || emailAccount.status !== 'CONNECTED') {
+      request.log.warn({ emailAccountId: emailAccount.id, provider: emailAccount.provider, status: emailAccount.status }, 'EmailAccount is not a connected Gmail account')
+      return reply.status(400).send({ success: false, message: 'EmailAccount must be a connected Gmail account' })
+    }
+
+    const emailAddress = emailAccount.emailAddress
+    const resolvedTenantId = emailAccount.tenantId
+
+    const watchResult = await registerGmailWatchForAccount(emailAccount)
+
+    request.log.info({ tenantId: resolvedTenantId, emailAccountId: emailAccount.id, emailAddress, historyId: watchResult.historyId, expiration: watchResult.expiration }, 'Gmail watch registered and saved to DB via fallback route')
+
+    return {
+      success: true,
+      emailAccountId: emailAccount.id,
+      emailAddress,
+      historyId: watchResult.historyId,
+      expiration: watchResult.expiration,
+    }
+  } catch (error) {
+    request.log.error({ error, tenantId, emailAccountId }, 'Error registering Gmail watch via fallback route')
     return reply.status(500).send({ success: false, message: 'Failed to register Gmail watch' })
   }
 })
@@ -896,6 +1109,12 @@ server.get('/dev/tenants', async () => {
           user: true,
         },
       },
+      emailAccounts: {
+        include: {
+          gmailCredential: true,
+        },
+      },
+      crmIntegrations: true,
     },
   })
 
@@ -909,6 +1128,29 @@ server.get('/dev/tenants', async () => {
       email: membership.user.email,
       createdAt: membership.user.createdAt,
       role: membership.role,
+    })),
+    emailAccounts: tenant.emailAccounts.map((account) => ({
+      id: account.id,
+      provider: account.provider,
+      emailAddress: account.emailAddress,
+      status: account.status,
+      gmailCredential: account.gmailCredential
+        ? {
+            id: account.gmailCredential.id,
+            encryptedAccessToken: account.gmailCredential.encryptedAccessToken,
+            encryptedRefreshToken: account.gmailCredential.encryptedRefreshToken,
+            tokenExpiresAt: account.gmailCredential.tokenExpiresAt,
+            scopes: account.gmailCredential.scopes,
+          }
+        : null,
+    })),
+    crmIntegrations: tenant.crmIntegrations.map((integration) => ({
+      id: integration.id,
+      provider: integration.provider,
+      status: integration.status,
+      accountName: integration.accountName,
+      encryptedAccessToken: integration.encryptedAccessToken,
+      tokenExpiresAt: integration.tokenExpiresAt,
     })),
   }))
 })
@@ -1095,15 +1337,30 @@ server.post('/dev/push-lead-hubspot/:id', async (request, reply) => {
       return reply.status(404).send({ success: false, message: 'ParsedLead not found' })
     }
 
+    // Get tenant from email account
+    const emailAccount = await prisma.emailAccount.findUnique({
+      where: { id: parsedLead.emailAccountId },
+      include: { tenant: true },
+    })
+
+    if (!emailAccount) {
+      request.log.warn({ parsedLeadId: id, emailAccountId: parsedLead.emailAccountId }, 'EmailAccount not found for parsed lead')
+      return reply.status(404).send({ success: false, message: 'Email account not found' })
+    }
+
+    const tenantId = emailAccount.tenantId
+    request.log.info({ parsedLeadId: id, tenantId }, 'Pushing parsed lead to HubSpot for tenant')
+
     const crmIntegration = await prisma.crmIntegration.findFirst({
       where: {
+        tenantId,
         provider: 'HUBSPOT',
         status: 'CONNECTED',
       },
     })
 
     if (!crmIntegration) {
-      request.log.warn('No connected HubSpot CRM integration found')
+      request.log.warn({ tenantId }, 'No connected HubSpot CRM integration found for tenant')
       return reply.status(404).send({ success: false, message: 'No connected HubSpot integration found' })
     }
 
@@ -1133,72 +1390,85 @@ server.post('/dev/retry-failed-leads', async (request, reply) => {
   request.log.info('Retrying failed HubSpot pushes for parsed leads')
 
   try {
-    const crmIntegration = await prisma.crmIntegration.findFirst({
-      where: {
-        provider: 'HUBSPOT',
-        status: 'CONNECTED',
+    // Get all tenants with connected HubSpot integrations
+    const tenantsWithHubSpot = await prisma.tenant.findMany({
+      include: {
+        crmIntegrations: {
+          where: {
+            provider: 'HUBSPOT',
+            status: 'CONNECTED',
+          },
+        },
       },
     })
 
-    if (!crmIntegration) {
-      request.log.warn('No connected HubSpot CRM integration found')
-      return reply.status(404).send({ success: false, message: 'No connected HubSpot integration found' })
-    }
+    const results = [] as Array<{ tenantId: string; id: string; success: boolean; message: string }>
 
-    const failedLeads = await prisma.parsedLead.findMany({
-      where: { crmPushStatus: 'FAILED' },
-    })
+    for (const tenant of tenantsWithHubSpot) {
+      const hubspotIntegration = tenant.crmIntegrations[0]
+      if (!hubspotIntegration) continue
 
-    const results = [] as Array<{ id: string; success: boolean; message: string }>
+      request.log.info({ tenantId: tenant.id }, 'Retrying failed HubSpot pushes for tenant')
 
-    for (const lead of failedLeads) {
-      if (lead.crmPushed) {
-        request.log.info({ parsedLeadId: lead.id }, 'Skipping already pushed lead during retry')
-        results.push({ id: lead.id, success: true, message: 'Already pushed' })
-        continue
-      }
+      // Get failed leads for this tenant
+      const failedLeads = await prisma.parsedLead.findMany({
+        where: {
+          crmPushStatus: 'FAILED',
+          emailAccount: {
+            tenantId: tenant.id,
+          },
+        },
+      })
 
-      try {
-        const hubspotId = await sendLeadToHubSpot(lead, crmIntegration)
-        if (hubspotId) {
-          await prisma.parsedLead.update({
-            where: { id: lead.id },
-            data: {
-              crmPushed: true,
-              crmProvider: 'HUBSPOT',
-              crmRecordId: hubspotId,
-              crmPushedAt: new Date(),
-              crmPushStatus: 'SUCCESS',
-              crmAttemptCount: { increment: 1 },
-              crmPushError: null,
-            },
-          })
-          request.log.info({ parsedLeadId: lead.id, crmRecordId: hubspotId }, 'Retried HubSpot push succeeded')
-          results.push({ id: lead.id, success: true, message: 'Retried successfully' })
-        } else {
+      for (const lead of failedLeads) {
+        if (lead.crmPushed) {
+          request.log.info({ parsedLeadId: lead.id, tenantId: tenant.id }, 'Skipping already pushed lead during retry')
+          results.push({ tenantId: tenant.id, id: lead.id, success: true, message: 'Already pushed' })
+          continue
+        }
+
+        try {
+          const hubspotId = await sendLeadToHubSpot(lead, hubspotIntegration)
+          if (hubspotId) {
+            await prisma.parsedLead.update({
+              where: { id: lead.id },
+              data: {
+                crmPushed: true,
+                crmProvider: 'HUBSPOT',
+                crmRecordId: hubspotId,
+                crmPushedAt: new Date(),
+                crmPushStatus: 'SUCCESS',
+                crmAttemptCount: { increment: 1 },
+                crmPushError: null,
+              },
+            })
+            request.log.info({ parsedLeadId: lead.id, tenantId: tenant.id, crmRecordId: hubspotId }, 'Retried HubSpot push succeeded')
+            results.push({ tenantId: tenant.id, id: lead.id, success: true, message: 'Retried successfully' })
+          } else {
+            await prisma.parsedLead.update({
+              where: { id: lead.id },
+              data: {
+                crmPushStatus: 'FAILED',
+                crmAttemptCount: { increment: 1 },
+                crmPushError: 'HubSpot push returned no contact id',
+              },
+            })
+            request.log.error({ parsedLeadId: lead.id, tenantId: tenant.id }, 'Retry HubSpot push failed: no contact id')
+            results.push({ tenantId: tenant.id, id: lead.id, success: false, message: 'No contact id returned' })
+          }
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : 'Unknown HubSpot push error'
           await prisma.parsedLead.update({
             where: { id: lead.id },
             data: {
               crmPushStatus: 'FAILED',
               crmAttemptCount: { increment: 1 },
-              crmPushError: 'HubSpot push returned no contact id',
+              crmPushError: errorMessage,
             },
           })
-          request.log.error({ parsedLeadId: lead.id }, 'Retry HubSpot push failed: no contact id')
-          results.push({ id: lead.id, success: false, message: 'No contact id returned' })
+          request.log.error({ parsedLeadId: lead.id, tenantId: tenant.id, error: errorMessage }, 'Retry HubSpot push error')
+          results.push({ tenantId: tenant.id, id: lead.id, success: false, message: errorMessage })
         }
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown HubSpot push error'
-        await prisma.parsedLead.update({
-          where: { id: lead.id },
-          data: {
-            crmPushStatus: 'FAILED',
-            crmAttemptCount: { increment: 1 },
-            crmPushError: errorMessage,
-          },
-        })
-        request.log.error({ parsedLeadId: lead.id, error: errorMessage }, 'Retry HubSpot push error')
-        results.push({ id: lead.id, success: false, message: errorMessage })
       }
     }
 
@@ -1231,44 +1501,51 @@ server.post('/dev/seed-hubspot-token', async (request, reply) => {
     return reply.status(403).send({ success: false, message: 'Not allowed in production' })
   }
 
-  const body = request.body as { token?: string }
+  const body = request.body as { tenantId?: string; token?: string }
+  const tenantId = body.tenantId?.trim()
   const token = body.token?.trim()
 
-  if (!token) {
-    return reply.status(400).send({ success: false, message: 'Missing token' })
+  if (!tenantId || !token) {
+    return reply.status(400).send({ success: false, message: 'Missing tenantId or token' })
   }
 
-  const tenant = await prisma.tenant.findFirst({
-    where: { name: SEED_TENANT_NAME },
-  })
-
+  const tenant = await prisma.tenant.findUnique({ where: { id: tenantId } })
   if (!tenant) {
-    request.log.warn({ tenantName: SEED_TENANT_NAME }, 'Seed tenant not found')
-    return reply.status(404).send({ success: false, message: 'Seed tenant not found' })
+    request.log.warn({ tenantId }, 'Tenant not found for HubSpot token seeding')
+    return reply.status(404).send({ success: false, message: 'Tenant not found' })
   }
 
-  const crmIntegration = await prisma.crmIntegration.upsert({
-    where: {
-      tenantId_provider: {
-        tenantId: tenant.id,
-        provider: 'HUBSPOT',
-      },
-    },
-    update: {
-      status: 'CONNECTED',
-      encryptedAccessToken: token,
-      accountName: 'Dev HubSpot',
-    },
-    create: {
-      tenantId: tenant.id,
-      provider: 'HUBSPOT',
-      status: 'CONNECTED',
-      encryptedAccessToken: token,
-      accountName: 'Dev HubSpot',
-    },
-  })
+  try {
+    server.log.info({ tenantId }, 'Seeding HubSpot token for tenant')
 
-  return { success: true, crmIntegration }
+    const crmIntegration = await prisma.crmIntegration.upsert({
+      where: {
+        tenantId_provider: {
+          tenantId,
+          provider: 'HUBSPOT',
+        },
+      },
+      update: {
+        status: 'CONNECTED',
+        encryptedAccessToken: token,
+        accountName: 'Dev HubSpot',
+      },
+      create: {
+        tenantId,
+        provider: 'HUBSPOT',
+        status: 'CONNECTED',
+        encryptedAccessToken: token,
+        accountName: 'Dev HubSpot',
+      },
+    })
+
+    server.log.info({ tenantId, crmIntegrationId: crmIntegration.id }, 'Seeded HubSpot token for tenant')
+
+    return { success: true, crmIntegration }
+  } catch (error) {
+    server.log.error({ error, tenantId }, 'Error seeding HubSpot token for tenant')
+    return reply.status(500).send({ success: false, message: 'Failed to seed HubSpot token' })
+  }
 })
 
 const start = async () => {
